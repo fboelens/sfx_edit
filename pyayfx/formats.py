@@ -11,6 +11,7 @@ from .wavetable import byte_to_signed
 
 PSG_NAME_SUFFIX = " PSG"
 SCC_NAME_SUFFIX = " SCC"
+AFX_PAIR_MAGIC = b"AYFXPSC1"
 
 
 def _u16le(data: bytes | bytearray, offset: int) -> int:
@@ -90,6 +91,58 @@ def save_afx(effect: Effect, path: str | Path) -> None:
     Path(path).write_bytes(encode_effect(effect))
 
 
+def load_afx_pair(path: str | Path) -> Effect:
+    path = Path(path)
+    data = path.read_bytes()
+    if data.startswith(AFX_PAIR_MAGIC):
+        return _decode_afx_pair(data, name_from_path(path))
+
+    if _is_scc_path(path):
+        effect = Effect(_paired_base_name(name_from_path(path), 0))
+        scc, _ = decode_effect(data, name_from_path(path))
+        effect.scc_frames = [frame.clone() for frame in scc.frames]
+        psg_path = _psg_path_for(path)
+        if psg_path.exists():
+            effect = load_afx(psg_path)
+            effect.scc_frames = [frame.clone() for frame in scc.frames]
+        return effect
+
+    effect, _ = decode_effect(data, name_from_path(path))
+    scc_path = _scc_path_for(path)
+    if scc_path.exists():
+        scc, _ = decode_effect(scc_path.read_bytes(), name_from_path(scc_path))
+        effect.scc_frames = [frame.clone() for frame in scc.frames]
+    return effect
+
+
+def save_afx_pair(effect: Effect, path: str | Path) -> Path:
+    path = Path(path)
+    psg = encode_effect(effect)
+    scc = encode_effect(_scc_effect(effect))
+    payload = bytearray(AFX_PAIR_MAGIC)
+    payload += struct.pack("<II", len(psg), len(scc))
+    payload += psg
+    payload += scc
+    path.write_bytes(bytes(payload))
+    return path
+
+
+def _decode_afx_pair(data: bytes, name: str) -> Effect:
+    header_len = len(AFX_PAIR_MAGIC) + 8
+    if len(data) < header_len:
+        raise ValueError("Combined AYFX effect file is too small.")
+    psg_len, scc_len = struct.unpack("<II", data[len(AFX_PAIR_MAGIC) : header_len])
+    psg_start = header_len
+    scc_start = psg_start + psg_len
+    end = scc_start + scc_len
+    if psg_len <= 0 or scc_len <= 0 or end > len(data):
+        raise ValueError("Combined AYFX effect file has invalid lengths.")
+    effect, _ = decode_effect(data[psg_start:scc_start], name)
+    scc, _ = decode_effect(data[scc_start:end], _paired_name(name, SCC_NAME_SUFFIX))
+    effect.scc_frames = [frame.clone() for frame in scc.frames]
+    return effect
+
+
 def load_afb(path: str | Path) -> Bank:
     path = Path(path)
     data = path.read_bytes()
@@ -163,9 +216,37 @@ def _paired_name(name: str, suffix: str) -> str:
     return f"{base[: 255 - len(suffix)]}{suffix}"
 
 
+def _is_scc_path(path: Path) -> bool:
+    return path.stem.casefold().endswith(SCC_NAME_SUFFIX.casefold())
+
+
+def _psg_path_for(path: Path) -> Path:
+    stem = path.stem
+    folded = stem.casefold()
+    if folded.endswith(SCC_NAME_SUFFIX.casefold()):
+        stem = stem[: -len(SCC_NAME_SUFFIX)]
+    if folded.endswith(PSG_NAME_SUFFIX.casefold()):
+        return path
+    return path.with_name(f"{stem}{PSG_NAME_SUFFIX}{path.suffix}")
+
+
+def _scc_path_for(path: Path) -> Path:
+    stem = path.stem
+    folded = stem.casefold()
+    for suffix in (PSG_NAME_SUFFIX, SCC_NAME_SUFFIX):
+        if folded.endswith(suffix.casefold()):
+            stem = stem[: -len(suffix)]
+            break
+    return path.with_name(f"{stem}{SCC_NAME_SUFFIX}{path.suffix}")
+
+
 def _scc_effect(effect: Effect) -> Effect:
     scc = Effect(_paired_name(effect.name, SCC_NAME_SUFFIX))
-    scc.frames = [Frame(frame.tone, frame.noise, frame.volume, frame.t, frame.n) for frame in effect.scc_frames]
+    waveform = effect.scc_frames[0].noise if effect.scc_frames else 0
+    scc.frames = [
+        Frame(frame.tone, waveform if index == 0 else 0, frame.volume, frame.t, frame.n)
+        for index, frame in enumerate(effect.scc_frames)
+    ]
     return scc
 
 
@@ -268,8 +349,14 @@ class _AyChip:
 SCC_CLOCK = 3_579_545
 
 
-def render_wav_bytes(effect: Effect, start_frame: int = 0, wavetables: list[list[int]] | None = None) -> bytes:
-    frames = max(0, max(effect.real_len(), effect.scc_real_len()) + 3 - start_frame)
+def render_wav_bytes(effect: Effect, start_frame: int = 0, wavetables: list[list[int]] | None = None, channel: str = "both") -> bytes:
+    if channel == "psg":
+        real_len = effect.real_len()
+    elif channel == "scc":
+        real_len = effect.scc_real_len()
+    else:
+        real_len = max(effect.real_len(), effect.scc_real_len())
+    frames = max(0, real_len + 3 - start_frame)
     samples_per_frame = MIX_RATE // 50
     total_samples = samples_per_frame * frames
     chip = _AyChip()
@@ -285,15 +372,17 @@ def render_wav_bytes(effect: Effect, start_frame: int = 0, wavetables: list[list
             frame = effect.frames[frame_index]
             scc_frame = effect.scc_frames[frame_index]
             scc_waveform = effect.scc_frames[0].noise
-            chip.out(0, frame.tone & 0xff)
-            chip.out(1, frame.tone >> 8)
-            chip.out(6, frame.noise)
-            chip.out(7, 0xF6 | (0 if frame.t else 1) | (0 if frame.n else 8))
-            chip.out(8, frame.volume)
+            if channel != "scc":
+                chip.out(0, frame.tone & 0xff)
+                chip.out(1, frame.tone >> 8)
+                chip.out(6, frame.noise)
+                chip.out(7, 0xF6 | (0 if frame.t else 1) | (0 if frame.n else 8))
+                chip.out(8, frame.volume)
             frame_index += 1
-        ay_value = int(chip.tick(ticks) / max(1, ticks))
-        scc_value = _scc_sample(scc_frame, wavetables, scc_phase, scc_waveform)
-        scc_phase = _scc_advance(scc_frame, scc_phase)
+        ay_value = int(chip.tick(ticks) / max(1, ticks)) if channel != "scc" else 0
+        scc_value = _scc_sample(scc_frame, wavetables, scc_phase, scc_waveform) if channel != "psg" else 0
+        if channel != "psg":
+            scc_phase = _scc_advance(scc_frame, scc_phase)
         value = int(ay_value * 0.7 + scc_value)
         value = max(-32768, min(32767, value))
         samples += struct.pack("<h", value)

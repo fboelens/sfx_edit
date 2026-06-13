@@ -16,11 +16,11 @@ from .formats import (
     import_vgm,
     import_wav,
     load_afb,
-    load_afx,
+    load_afx_pair,
     render_scc_wave_bytes,
     render_wav_bytes,
     save_afb,
-    save_afx,
+    save_afx_pair,
 )
 from .model import MAX_FX_LEN, Bank, Effect, Frame, clean_effect_filename
 from .sfx_tools import (
@@ -60,6 +60,7 @@ AY_VOLUME_BAR = 770
 SCC_PERIOD_BAR = 850
 SCC_VOLUME_BAR = 1120
 SCC_WAVEFORM_BAR = 1210
+DEFAULT_WAVETABLE = "wavetable.asm"
 
 
 class AyFxEditor(tk.Tk):
@@ -79,6 +80,7 @@ class AyFxEditor(tk.Tk):
         self.export_all = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
         self._play_file: str | None = None
+        self.load_default_wavetable()
 
         self._build_menu()
         self._build_toolbar()
@@ -98,6 +100,7 @@ class AyFxEditor(tk.Tk):
         file_menu.add_command(label="Load bank...", command=self.load_bank, accelerator="Ctrl+O")
         file_menu.add_command(label="Save bank...", command=lambda: self.save_bank(True), accelerator="Ctrl+S")
         file_menu.add_command(label="Save bank w/o names...", command=lambda: self.save_bank(False))
+        file_menu.add_command(label="Save split banks of 32...", command=self.save_split_banks)
         file_menu.add_separator()
         file_menu.add_command(label="Clear current effect", command=self.clear_effect)
         file_menu.add_command(label="Load current effect...", command=self.load_effect)
@@ -192,6 +195,8 @@ class AyFxEditor(tk.Tk):
         toolbar = ttk.Frame(self, padding=(6, 5))
         toolbar.pack(fill="x")
         ttk.Button(toolbar, text="Play", command=self.play).pack(side="left")
+        ttk.Button(toolbar, text="PSG", command=lambda: self.play(channel="psg")).pack(side="left", padx=(4, 0))
+        ttk.Button(toolbar, text="SCC", command=lambda: self.play(channel="scc")).pack(side="left", padx=(4, 0))
         ttk.Button(toolbar, text="Stop", command=self.stop).pack(side="left", padx=(4, 12))
         ttk.Button(toolbar, text="Add", command=self.add_effect).pack(side="left")
         ttk.Button(toolbar, text="Del", command=self.delete_effect).pack(side="left", padx=(4, 12))
@@ -488,7 +493,11 @@ class AyFxEditor(tk.Tk):
 
     def new_bank(self) -> None:
         self.stop()
+        wavetable_names = list(self.bank.wavetable_names)
+        wavetables = [list(wave) for wave in self.bank.wavetables]
         self.bank = Bank()
+        self.bank.wavetable_names = wavetable_names
+        self.bank.wavetables = wavetables
         self.current_index = 0
         self.cursor_row = 0
         self.status.set("New bank")
@@ -499,12 +508,29 @@ class AyFxEditor(tk.Tk):
         if not path:
             return
         try:
+            wavetable_names = list(self.bank.wavetable_names)
+            wavetables = [list(wave) for wave in self.bank.wavetables]
             self.bank = load_afb(path)
+            self.bank.wavetable_names = wavetable_names
+            self.bank.wavetables = wavetables
             self.current_index = 0
             self.status.set(f"Loaded {Path(path).name}")
             self.refresh_all()
         except Exception as exc:
             messagebox.showerror("Load bank", str(exc))
+
+    def load_default_wavetable(self) -> None:
+        paths = [Path.cwd() / DEFAULT_WAVETABLE, Path(__file__).resolve().parent.parent / DEFAULT_WAVETABLE]
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                self.bank.wavetable_names, self.bank.wavetables = parse_wavetable_asm(path)
+                self.status.set(f"Loaded wavetable {path.name}")
+                return
+            except Exception as exc:
+                self.status.set(f"Could not load {path.name}: {exc}")
+                return
 
     def save_bank(self, names: bool) -> None:
         path = filedialog.asksaveasfilename(defaultextension=".afb", filetypes=[("AYFX bank", "*.afb"), ("All files", "*.*")])
@@ -516,6 +542,23 @@ class AyFxEditor(tk.Tk):
             self.refresh_all()
         except Exception as exc:
             messagebox.showerror("Save bank", str(exc))
+
+    def save_split_banks(self) -> None:
+        path = filedialog.asksaveasfilename(defaultextension=".afb", filetypes=[("AYFX bank", "*.afb"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            base_path = Path(path)
+            saved = []
+            for bank_index, start in enumerate(range(0, len(self.bank.effects), 32), start=1):
+                chunk = Bank()
+                chunk.effects = self.bank.effects[start : start + 32]
+                chunk_path = base_path.with_name(f"{base_path.stem}_{bank_index:02d}{base_path.suffix or '.afb'}")
+                save_afb(chunk, chunk_path, include_names=True)
+                saved.append(chunk_path)
+            self.status.set(f"Saved {len(saved)} split bank{'s' if len(saved) != 1 else ''}")
+        except Exception as exc:
+            messagebox.showerror("Save split banks", str(exc))
 
     def load_wavetable(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("ASM wavetable", "*.asm"), ("All files", "*.*")])
@@ -629,21 +672,20 @@ class AyFxEditor(tk.Tk):
         if not path:
             return
         try:
-            self.bank.effects[self.current_index] = load_afx(path)
-            self.clear_scc_effect()
+            self.bank.effects[self.current_index] = load_afx_pair(path)
             self.status.set(f"Loaded {Path(path).name}")
             self.refresh_all()
         except Exception as exc:
             messagebox.showerror("Load effect", str(exc))
 
     def save_effect(self) -> None:
-        if self.effect.real_len() == 0:
+        if self.effect.real_len() == 0 and self.effect.scc_real_len() == 0:
             messagebox.showinfo("Save effect", "Effect is empty, nothing to save.")
             return
         path = filedialog.asksaveasfilename(initialfile=f"{clean_effect_filename(self.effect.name)}.afx", defaultextension=".afx", filetypes=[("AYFX effect", "*.afx"), ("All files", "*.*")])
         if path:
-            save_afx(self.effect, path)
-            self.status.set(f"Saved {Path(path).name}")
+            saved_path = save_afx_pair(self.effect, path)
+            self.status.set(f"Saved {saved_path.name}")
 
     def multi_load(self) -> None:
         paths = filedialog.askopenfilenames(filetypes=[("AYFX effects", "*.afx"), ("All files", "*.*")])
@@ -655,7 +697,7 @@ class AyFxEditor(tk.Tk):
         for path in paths:
             if start >= 256:
                 break
-            effect = load_afx(path)
+            effect = load_afx_pair(path)
             if start < len(self.bank.effects):
                 self.bank.effects[start] = effect
             else:
@@ -669,15 +711,14 @@ class AyFxEditor(tk.Tk):
         if not directory:
             return
         for index, effect in enumerate(self.bank.effects):
-            if effect.real_len() <= 0:
+            if effect.real_len() <= 0 and effect.scc_real_len() <= 0:
                 continue
             path = Path(directory) / f"{clean_effect_filename(effect.name)}.afx"
-            save_afx(effect, path)
+            save_afx_pair(effect, path)
         self.status.set("Saved non-empty effects")
 
     def clear_effect(self) -> None:
         self.effect.clear()
-        self.clear_scc_effect()
         self.status.set("Effect cleared")
         self.refresh_grid()
 
@@ -846,9 +887,9 @@ class AyFxEditor(tk.Tk):
             writer(self.effect, path)
             self.status.set(f"Exported {Path(path).name}")
 
-    def play(self, from_cursor: bool = False) -> None:
+    def play(self, from_cursor: bool = False, channel: str = "both") -> None:
         self.stop()
-        data = render_wav_bytes(self.effect, self.cursor_row if from_cursor else 0, self.bank.wavetables)
+        data = render_wav_bytes(self.effect, self.cursor_row if from_cursor else 0, self.bank.wavetables, channel)
         handle = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         handle.write(data)
         handle.close()
@@ -860,7 +901,8 @@ class AyFxEditor(tk.Tk):
         else:
             self.status.set(f"Rendered preview to {self._play_file}")
             return
-        self.status.set("Playing")
+        label = {"psg": "PSG", "scc": "SCC"}.get(channel, "mix")
+        self.status.set(f"Playing {label}")
 
     def stop(self) -> None:
         if sys.platform.startswith("win"):

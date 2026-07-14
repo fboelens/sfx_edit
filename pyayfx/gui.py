@@ -5,6 +5,8 @@ import os
 import sys
 import tempfile
 import tkinter as tk
+from array import array
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -49,18 +51,52 @@ from .wavetable import byte_to_signed, parse_wavetable_asm, save_wavetable_asm, 
 
 TITLE = "AY Sound FX Editor Python"
 LINE_HEIGHT = 18
-VISIBLE_ROWS = 32
+GRID_TOP = 28
 BAR_WIDTH = 260
 SCC_PERIOD_COL = 250
 SCC_VOLUME_COL = 314
 SCC_WAVEFORM_COL = 362
 AY_PERIOD_BAR = 430
-AY_NOISE_BAR = 700
-AY_VOLUME_BAR = 770
+AY_VOLUME_BAR = 700
+AY_NOISE_BAR = 770
 SCC_PERIOD_BAR = 850
 SCC_VOLUME_BAR = 1120
 SCC_WAVEFORM_BAR = 1210
 DEFAULT_WAVETABLE = "wavetable.asm"
+
+# Transferable columns. Right-clicking works on the bars themselves; their
+# small gutter also provides a target that cannot change the input value.
+SELECTABLE_COLUMNS = (
+    ("psg", "tone", AY_PERIOD_BAR, AY_PERIOD_BAR + BAR_WIDTH),
+    ("psg", "volume", AY_VOLUME_BAR, AY_VOLUME_BAR + 60),
+    ("scc", "tone", SCC_PERIOD_BAR, SCC_PERIOD_BAR + BAR_WIDTH),
+    ("scc", "volume", SCC_VOLUME_BAR, SCC_VOLUME_BAR + 80),
+)
+SELECTION_CURSOR_COLUMNS = (0, 1, 3, 4)
+TRANSFER_COLUMN_RANGES = {"psg": (0, 1), "scc": (2, 3)}
+TEXT_CELL_COLUMNS = (
+    (0, 100, 151),
+    (1, 152, 195),
+    (3, 242, 307),
+    (4, 308, 355),
+)
+TEXT_CHANNEL_RANGES = {"psg": (100, 195), "scc": (242, 355)}
+NON_SELECTABLE_TEXT_RANGES = ((196, 239), (356, 425))
+SELECTION_GUTTER_WIDTH = 8
+UNDO_LIMIT = 50
+
+
+@dataclass
+class UndoState:
+    bank: Bank
+    effects: list[Effect]
+    current_index: int
+    effect: Effect
+    effect_name: str
+    frames: array
+    scc_frames: array
+    wavetable_names: list[str]
+    wavetables: list[list[int]]
 
 
 class AyFxEditor(tk.Tk):
@@ -76,6 +112,14 @@ class AyFxEditor(tk.Tk):
         self.cursor_col = 0
         self.clipboard: list[Frame] = []
         self.scc_clipboard: list[Frame] = []
+        self.column_clipboard: dict[str, object] | None = None
+        self.column_selection: tuple[int, int, int, int, str] | None = None
+        self._right_anchor: tuple[int, int, str] | None = None
+        self._right_dragged = False
+        self._right_popup_allowed = False
+        self.hover_channel: str | None = None
+        self.undo_stack: list[UndoState] = []
+        self._left_drag_undo_recorded = False
         self.period_linear = tk.BooleanVar(value=True)
         self.export_all = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
@@ -103,6 +147,8 @@ class AyFxEditor(tk.Tk):
         file_menu.add_command(label="Save split banks of 32...", command=self.save_split_banks)
         file_menu.add_separator()
         file_menu.add_command(label="Clear current effect", command=self.clear_effect)
+        file_menu.add_command(label="Clear PSG part", command=self.clear_psg_effect)
+        file_menu.add_command(label="Clear SCC part", command=self.clear_scc_effect)
         file_menu.add_command(label="Load current effect...", command=self.load_effect)
         file_menu.add_command(label="Save current effect...", command=self.save_effect)
         file_menu.add_command(label="Multi-load to bank...", command=self.multi_load)
@@ -112,6 +158,8 @@ class AyFxEditor(tk.Tk):
         menubar.add_cascade(label="File", menu=file_menu)
 
         edit_menu = tk.Menu(menubar, tearoff=False)
+        edit_menu.add_command(label="Undo", command=self.undo, accelerator="Ctrl+Z")
+        edit_menu.add_separator()
         edit_menu.add_command(label="Cut", command=self.cut, accelerator="Ctrl+X")
         edit_menu.add_command(label="Copy", command=self.copy, accelerator="Ctrl+C")
         edit_menu.add_command(label="Paste", command=self.paste, accelerator="Ctrl+V")
@@ -216,7 +264,7 @@ class AyFxEditor(tk.Tk):
     def _build_editor(self) -> None:
         outer = ttk.Frame(self)
         outer.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(outer, background="white", highlightthickness=0)
+        self.canvas = tk.Canvas(outer, background="white", highlightthickness=0, takefocus=True)
         yscroll = ttk.Scrollbar(outer, orient="vertical", command=self.on_scrollbar)
         self.canvas.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
@@ -225,6 +273,11 @@ class AyFxEditor(tk.Tk):
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Button-3>", self.on_right_click)
         self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
+        self.canvas.bind("<B3-Motion>", self.on_right_drag)
+        self.canvas.bind("<ButtonRelease-3>", self.on_right_release)
+        self.canvas.bind("<Motion>", self.on_canvas_motion)
+        self.canvas.bind("<Leave>", self.on_canvas_leave)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
 
     def _build_status(self) -> None:
@@ -236,9 +289,10 @@ class AyFxEditor(tk.Tk):
         self.bind("<Control-s>", lambda _event: self.save_bank(True))
         self.bind("<Control-a>", lambda _event: self.select_all())
         self.bind("<Control-i>", lambda _event: self.inverse_selection())
-        self.bind("<Control-x>", lambda _event: self.cut())
-        self.bind("<Control-c>", lambda _event: self.copy())
-        self.bind("<Control-v>", lambda _event: self.paste())
+        self.canvas.bind("<Control-x>", self.on_cut_shortcut)
+        self.canvas.bind("<Control-c>", self.on_copy_shortcut)
+        self.canvas.bind("<Control-v>", self.on_paste_shortcut)
+        self.canvas.bind("<Control-z>", self.on_undo_shortcut)
         self.bind("<Delete>", lambda _event: self.delete_selection())
         self.bind("<Insert>", lambda event: self.insert_frame(clone=bool(event.state & 0x4)))
         self.bind("<Up>", lambda _event: self.move_cursor(0, -1))
@@ -255,6 +309,86 @@ class AyFxEditor(tk.Tk):
         for char in "0123456789abcdefABCDEF":
             self.bind(char, self.enter_hex)
 
+    def on_cut_shortcut(self, _event: tk.Event) -> str:
+        self.cut()
+        return "break"
+
+    def on_copy_shortcut(self, _event: tk.Event) -> str:
+        self.copy()
+        return "break"
+
+    def on_paste_shortcut(self, _event: tk.Event) -> str:
+        self.paste()
+        return "break"
+
+    def on_undo_shortcut(self, _event: tk.Event) -> str:
+        self.undo()
+        return "break"
+
+    @staticmethod
+    def _pack_frames(frames: list[Frame]) -> array:
+        return array(
+            "I",
+            (
+                frame.tone
+                | (frame.noise << 12)
+                | (frame.volume << 17)
+                | (int(frame.t) << 21)
+                | (int(frame.n) << 22)
+                | (int(frame.selected) << 23)
+                for frame in frames
+            ),
+        )
+
+    @staticmethod
+    def _unpack_frames(values: array) -> list[Frame]:
+        return [
+            Frame(
+                tone=value & 0x0FFF,
+                noise=(value >> 12) & 0x1F,
+                volume=(value >> 17) & 0x0F,
+                t=bool(value & (1 << 21)),
+                n=bool(value & (1 << 22)),
+                selected=bool(value & (1 << 23)),
+            )
+            for value in values
+        ]
+
+    def _record_undo(self) -> None:
+        effect = self.effect
+        self.undo_stack.append(
+            UndoState(
+                bank=self.bank,
+                effects=list(self.bank.effects),
+                current_index=self.current_index,
+                effect=effect,
+                effect_name=effect.name,
+                frames=self._pack_frames(effect.frames),
+                scc_frames=self._pack_frames(effect.scc_frames),
+                wavetable_names=list(self.bank.wavetable_names),
+                wavetables=[list(wave) for wave in self.bank.wavetables],
+            )
+        )
+        if len(self.undo_stack) > UNDO_LIMIT:
+            del self.undo_stack[0]
+
+    def undo(self) -> None:
+        if not self.undo_stack:
+            self.status.set("Nothing to undo")
+            return
+        state = self.undo_stack.pop()
+        self.bank = state.bank
+        self.bank.effects = list(state.effects)
+        state.effect.name = state.effect_name
+        state.effect.frames = self._unpack_frames(state.frames)
+        state.effect.scc_frames = self._unpack_frames(state.scc_frames)
+        self.bank.wavetable_names = list(state.wavetable_names)
+        self.bank.wavetables = [list(wave) for wave in state.wavetables]
+        self.current_index = max(0, min(state.current_index, len(self.bank.effects) - 1))
+        self.column_selection = None
+        self.status.set(f"Undo ({len(self.undo_stack)} action(s) remaining)")
+        self.refresh_all()
+
     def refresh_all(self) -> None:
         self.name_var.set(self.effect.name)
         self.count_label.configure(text=f"{self.current_index + 1:03d}/{len(self.bank.effects):03d}")
@@ -266,42 +400,52 @@ class AyFxEditor(tk.Tk):
 
     def refresh_grid(self) -> None:
         width = max(self.canvas.winfo_width(), 1320)
+        visible_rows = self._visible_rows()
         self.canvas.delete("all")
+        if self.hover_channel:
+            x1, x2 = TEXT_CHANNEL_RANGES[self.hover_channel]
+            self.canvas.create_rectangle(x1, 0, x2, GRID_TOP, fill="#dce9ff", outline="")
+            for channel, _field, bar_x1, bar_x2 in SELECTABLE_COLUMNS:
+                if channel == self.hover_channel:
+                    self.canvas.create_rectangle(bar_x1, 0, bar_x2, GRID_TOP, fill="#dce9ff", outline="")
         headers = [
             ("Pos", 8),
             ("T", 52),
             ("N", 76),
             ("Per", 108),
-            ("Ns", 160),
-            ("V", 202),
+            ("V", 160),
+            ("Ns", 202),
             ("SPer", SCC_PERIOD_COL),
             ("SVol", SCC_VOLUME_COL),
             ("SWf", SCC_WAVEFORM_COL),
             ("AY Period", AY_PERIOD_BAR),
-            ("AY Noise", AY_NOISE_BAR),
             ("AY Vol", AY_VOLUME_BAR),
+            ("AY Noise", AY_NOISE_BAR),
             ("SCC Period", SCC_PERIOD_BAR),
             ("SCC Vol", SCC_VOLUME_BAR),
             ("Wave", SCC_WAVEFORM_BAR),
         ]
         for text, x in headers:
             self.canvas.create_text(x, 8, text=text, anchor="nw", fill="#222")
-        for row in range(VISIBLE_ROWS):
+        for row in range(visible_rows):
             index = self._top_row() + row
             if index >= MAX_FX_LEN:
                 break
             self.draw_row(index, row, width)
-        self.yscroll.set(self._top_row() / MAX_FX_LEN, min(1, (self._top_row() + VISIBLE_ROWS) / MAX_FX_LEN))
+        self.yscroll.set(self._top_row() / MAX_FX_LEN, min(1, (self._top_row() + visible_rows) / MAX_FX_LEN))
 
     def draw_row(self, index: int, row: int, width: int) -> None:
         frame = self.effect.frames[index]
         scc = self.scc_frame(index)
-        y = 28 + row * LINE_HEIGHT
+        y = GRID_TOP + row * LINE_HEIGHT
         actual = index < self.effect.real_len()
         bg = "#dff3df" if frame.selected else "#ffffff"
         if index == self.cursor_row:
             bg = "#e8f0ff"
         self.canvas.create_rectangle(0, y, width, y + LINE_HEIGHT, fill=bg, outline="")
+        if self.hover_channel:
+            x1, x2 = TEXT_CHANNEL_RANGES[self.hover_channel]
+            self.canvas.create_rectangle(x1, y, x2, y + LINE_HEIGHT, fill="#edf4ff", outline="")
         color = "#111" if actual else "#888"
         self.canvas.create_text(8, y + 2, text=f"{index:03X}", anchor="nw", fill=color)
         self.canvas.create_text(54, y + 2, text="T" if frame.t else "-", anchor="nw", fill=color)
@@ -311,8 +455,8 @@ class AyFxEditor(tk.Tk):
         wave_name = self.bank.wavetable_names[effective_waveform] if 0 <= effective_waveform < len(self.bank.wavetable_names) else ""
         values = [
             f"{frame.tone:03X}",
-            f"{frame.noise:02X}",
             f"{frame.volume:X}",
+            f"{frame.noise:02X}",
             f"{scc.tone:03X}",
             f"{scc.volume:X}",
             f"{effective_waveform:02X}",
@@ -326,17 +470,66 @@ class AyFxEditor(tk.Tk):
                 fill = color
             self.canvas.create_text(x, y + 2, text=value, anchor="nw", fill=fill)
         self.canvas.create_text(SCC_WAVEFORM_COL + 30, y + 2, text=wave_name[:16], anchor="nw", fill="#555")
+        self._draw_selection_gutters(y)
         self._bar(AY_PERIOD_BAR, y + 3, BAR_WIDTH, LINE_HEIGHT - 6, self._period_width(frame.tone), "#717b91")
-        self._bar(AY_NOISE_BAR, y + 3, 60, LINE_HEIGHT - 6, frame.noise / 31 if frame.noise else 0, "#4f8f72")
         self._bar(AY_VOLUME_BAR, y + 3, 60, LINE_HEIGHT - 6, frame.volume / 15 if frame.volume else 0, "#b46b5f")
+        self._bar(AY_NOISE_BAR, y + 3, 60, LINE_HEIGHT - 6, frame.noise / 31 if frame.noise else 0, "#4f8f72")
         self._bar(SCC_PERIOD_BAR, y + 3, BAR_WIDTH, LINE_HEIGHT - 6, self._period_width(scc.tone), "#806f9a")
         self._bar(SCC_VOLUME_BAR, y + 3, 80, LINE_HEIGHT - 6, scc.volume / 15 if scc.volume else 0, "#b46b5f")
         self._bar(SCC_WAVEFORM_BAR, y + 3, 120, LINE_HEIGHT - 6, effective_waveform / 31 if effective_waveform else 0, "#4f8f72")
+        self._draw_column_hover(y)
+        self._draw_column_selection(index, y)
 
     def _bar(self, x: int, y: int, w: int, h: int, frac: float, color: str) -> None:
         self.canvas.create_rectangle(x, y, x + w, y + h, fill="#f4f4f4", outline="#d0d0d0")
         if frac > 0:
             self.canvas.create_rectangle(x, y, x + max(2, int(w * min(1, frac))), y + h, fill=color, outline=color)
+
+    def _draw_column_selection(self, index: int, y: int) -> None:
+        if not self.column_selection:
+            return
+        first_row, last_row, first_col, last_col, _channel = self.column_selection
+        if not first_row <= index <= last_row:
+            return
+        for column in range(first_col, last_col + 1):
+            _channel, _field, x1, x2 = SELECTABLE_COLUMNS[column]
+            self.canvas.create_rectangle(
+                x1,
+                y + 1,
+                x2,
+                y + LINE_HEIGHT - 1,
+                fill="#8fb7ff",
+                stipple="gray25",
+                outline="#2f6fd0",
+                width=2,
+            )
+
+    def _draw_column_hover(self, y: int) -> None:
+        if not self.hover_channel:
+            return
+        for channel, _field, x1, x2 in SELECTABLE_COLUMNS:
+            if channel == self.hover_channel:
+                self.canvas.create_rectangle(
+                    x1,
+                    y + 1,
+                    x2,
+                    y + LINE_HEIGHT - 1,
+                    fill="#a9c8ff",
+                    stipple="gray12",
+                    outline="#8aafea",
+                )
+
+    def _draw_selection_gutters(self, y: int) -> None:
+        for channel, _field, x1, _x2 in SELECTABLE_COLUMNS:
+            fill = "#bcd3ff" if channel == self.hover_channel else "#eeeeee"
+            self.canvas.create_rectangle(
+                x1 - SELECTION_GUTTER_WIDTH,
+                y + 1,
+                x1 - 2,
+                y + LINE_HEIGHT - 1,
+                fill=fill,
+                outline="#c5c5c5",
+            )
 
     def _period_width(self, period: int) -> float:
         if period <= 0:
@@ -354,18 +547,35 @@ class AyFxEditor(tk.Tk):
     def scc_initial_waveform(self) -> int:
         return self.effect.scc_frames[0].noise if self.effect.scc_frames else 0
 
-    def clear_scc_effect(self) -> None:
+    def _clear_scc_frames(self) -> None:
         self.effect.scc_frames = [Frame() for _ in range(MAX_FX_LEN)]
 
+    def clear_psg_effect(self) -> None:
+        self._record_undo()
+        self.effect.frames = [Frame() for _ in range(MAX_FX_LEN)]
+        self.status.set("PSG part cleared")
+        self.refresh_grid()
+
+    def clear_scc_effect(self) -> None:
+        self._record_undo()
+        self._clear_scc_frames()
+        self.status.set("SCC part cleared")
+        self.refresh_grid()
+
+    def _visible_rows(self) -> int:
+        available_height = self.canvas.winfo_height() - GRID_TOP
+        return max(1, min(MAX_FX_LEN, available_height // LINE_HEIGHT))
+
     def _top_row(self) -> int:
-        return max(0, min(MAX_FX_LEN - VISIBLE_ROWS, getattr(self, "top_row", 0)))
+        return max(0, min(MAX_FX_LEN - self._visible_rows(), getattr(self, "top_row", 0)))
 
     def ensure_cursor_visible(self) -> None:
         top = self._top_row()
+        visible_rows = self._visible_rows()
         if self.cursor_row < top:
             self.top_row = self.cursor_row
-        elif self.cursor_row >= top + VISIBLE_ROWS:
-            self.top_row = self.cursor_row - VISIBLE_ROWS + 1
+        elif self.cursor_row >= top + visible_rows:
+            self.top_row = self.cursor_row - visible_rows + 1
 
     def set_cursor(self, row: int) -> None:
         self.cursor_row = max(0, min(MAX_FX_LEN - 1, row))
@@ -383,13 +593,17 @@ class AyFxEditor(tk.Tk):
             digit = int(event.char, 16)
         except ValueError:
             return
+        if self.cursor_col == 5 and self.cursor_row != 0:
+            self.status.set("SCC waveform is fixed by frame 000")
+            return
+        self._record_undo()
         frame = self.effect.frames[self.cursor_row]
         if self.cursor_col == 0:
             frame.tone = ((frame.tone << 4) | digit) & 0x0fff
         elif self.cursor_col == 1:
-            frame.noise = ((frame.noise << 4) | digit) & 0x1f
-        elif self.cursor_col == 2:
             frame.volume = digit & 0x0f
+        elif self.cursor_col == 2:
+            frame.noise = ((frame.noise << 4) | digit) & 0x1f
         else:
             scc = self.scc_frame(self.cursor_row)
             if self.cursor_col == 3:
@@ -397,29 +611,187 @@ class AyFxEditor(tk.Tk):
             elif self.cursor_col == 4:
                 scc.volume = digit & 0x0f
             elif self.cursor_col == 5:
-                if self.cursor_row == 0:
-                    scc.noise = ((scc.noise << 4) | digit) & 0x1f
-                else:
-                    self.status.set("SCC waveform is fixed by frame 000")
+                scc.noise = ((scc.noise << 4) | digit) & 0x1f
         self.refresh_grid()
 
     def toggle_flag(self, flag: str) -> None:
+        self._record_undo()
         frame = self.effect.frames[self.cursor_row]
         setattr(frame, flag, not getattr(frame, flag))
         self.refresh_grid()
 
     def on_click(self, event: tk.Event) -> None:
+        self.canvas.focus_set()
+        self.column_selection = None
+        self._left_drag_undo_recorded = self._pointer_edits_data(event.x)
+        if self._left_drag_undo_recorded:
+            self._record_undo()
         self._handle_pointer(event.x, event.y, right=False)
 
     def on_right_click(self, event: tk.Event) -> None:
-        self._handle_pointer(event.x, event.y, right=True)
+        self.canvas.focus_set()
+        cell = self._selection_cell_at(event.x, event.y)
+        self._right_dragged = False
+        self._right_popup_allowed = cell is not None
+        self._right_anchor = cell
+        if cell is not None:
+            row, column, channel = cell
+            if not self._column_selection_contains(row, column, channel):
+                first_transfer_col, last_transfer_col = TRANSFER_COLUMN_RANGES[channel]
+                self.column_selection = (
+                    row,
+                    row,
+                    min(column, first_transfer_col),
+                    max(column, last_transfer_col),
+                    channel,
+                )
+            self.cursor_row = row
+            self.cursor_col = SELECTION_CURSOR_COLUMNS[column]
+            self.refresh_grid()
+        else:
+            target = self._text_cell_at(event.x, event.y)
+            if target is not None:
+                self._right_popup_allowed = True
+                self.column_selection = None
+                self._set_cell_target(*target)
+                self.refresh_grid()
+
+    def on_right_drag(self, event: tk.Event) -> None:
+        if self._right_anchor is None:
+            return
+        cell = self._selection_cell_at(event.x, event.y)
+        if cell is None or cell[2] != self._right_anchor[2]:
+            return
+        anchor_row, anchor_col, channel = self._right_anchor
+        row, column, _channel = cell
+        first_transfer_col, last_transfer_col = TRANSFER_COLUMN_RANGES[channel]
+        self._right_dragged = True
+        self.column_selection = (
+            min(anchor_row, row),
+            max(anchor_row, row),
+            min(anchor_col, column, first_transfer_col),
+            max(anchor_col, column, last_transfer_col),
+            channel,
+        )
+        self.cursor_row = row
+        self.cursor_col = SELECTION_CURSOR_COLUMNS[column]
+        self.status.set(f"Selected {channel.upper()} rows {min(anchor_row, row):03X}-{max(anchor_row, row):03X}")
+        self.refresh_grid()
+
+    def on_right_release(self, event: tk.Event) -> None:
+        self._right_anchor = None
+        if not self._right_dragged and self._right_popup_allowed:
+            self._show_edit_popup(event)
+
+    def _selection_cell_at(self, x: int, y: int) -> tuple[int, int, str] | None:
+        visible_row = (y - GRID_TOP) // LINE_HEIGHT
+        if visible_row < 0 or visible_row >= self._visible_rows():
+            return None
+        row = self._top_row() + visible_row
+        if row >= MAX_FX_LEN:
+            return None
+        for column, (channel, _field, x1, x2) in enumerate(SELECTABLE_COLUMNS):
+            if x1 - SELECTION_GUTTER_WIDTH <= x <= x2:
+                return row, column, channel
+        return None
+
+    def _selectable_column_at(self, x: int) -> tuple[int, str] | None:
+        for column, (channel, _field, x1, x2) in enumerate(SELECTABLE_COLUMNS):
+            if x1 - SELECTION_GUTTER_WIDTH <= x <= x2:
+                return column, channel
+        return None
+
+    def _selection_gutter_at(self, x: int) -> tuple[int, str] | None:
+        for column, (channel, _field, x1, _x2) in enumerate(SELECTABLE_COLUMNS):
+            if x1 - SELECTION_GUTTER_WIDTH <= x <= x1 - 2:
+                return column, channel
+        return None
+
+    def _visible_row_at(self, y: int) -> int | None:
+        visible_row = (y - GRID_TOP) // LINE_HEIGHT
+        if visible_row < 0 or visible_row >= self._visible_rows():
+            return None
+        row = self._top_row() + visible_row
+        return row if row < MAX_FX_LEN else None
+
+    def _text_cell_at(self, x: int, y: int) -> tuple[int, int] | None:
+        row = self._visible_row_at(y)
+        if row is None:
+            return None
+        for column, x1, x2 in TEXT_CELL_COLUMNS:
+            if x1 <= x <= x2:
+                return row, column
+        return None
+
+    def _text_channel_at(self, x: int) -> str | None:
+        for channel, (x1, x2) in TEXT_CHANNEL_RANGES.items():
+            if x1 <= x <= x2:
+                return channel
+        return None
+
+    def on_canvas_motion(self, event: tk.Event) -> None:
+        channel = self._text_channel_at(event.x) if event.y >= GRID_TOP else None
+        if channel is None and event.y >= GRID_TOP:
+            selectable = self._selectable_column_at(event.x)
+            channel = selectable[1] if selectable else None
+        if channel != self.hover_channel:
+            self.hover_channel = channel
+            self.refresh_grid()
+
+    def on_canvas_leave(self, _event: tk.Event) -> None:
+        if self.hover_channel is not None:
+            self.hover_channel = None
+            self.refresh_grid()
+
+    def _column_selection_contains(self, row: int, column: int, channel: str) -> bool:
+        if not self.column_selection:
+            return False
+        first_row, last_row, first_col, last_col, selected_channel = self.column_selection
+        return selected_channel == channel and first_row <= row <= last_row and first_col <= column <= last_col
+
+    def _show_edit_popup(self, event: tk.Event) -> None:
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="Copy", command=self.copy)
+        menu.add_command(label="Cut", command=self.cut)
+        menu.add_command(label="Paste", command=self.paste)
+        menu.add_separator()
+        menu.add_command(label="Clear selection", command=self.unselect_all)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+            self.canvas.focus_set()
+
+    def _set_cell_target(self, row: int, column: int) -> None:
+        self.cursor_row = row
+        self.cursor_col = column
+        channel = "PSG" if column <= 2 else "SCC"
+        self.status.set(f"Paste target: {channel} row {row:03X}")
 
     def on_drag(self, event: tk.Event) -> None:
+        if not self._left_drag_undo_recorded and self._pointer_edits_data(event.x):
+            self._record_undo()
+            self._left_drag_undo_recorded = True
         self._handle_pointer(event.x, event.y, right=False, drag=True)
 
+    def on_left_release(self, _event: tk.Event) -> None:
+        self._left_drag_undo_recorded = False
+
+    @staticmethod
+    def _pointer_edits_data(x: int) -> bool:
+        return (
+            48 <= x <= 92
+            or AY_PERIOD_BAR <= x <= AY_PERIOD_BAR + BAR_WIDTH
+            or AY_VOLUME_BAR <= x <= AY_VOLUME_BAR + 60
+            or AY_NOISE_BAR <= x <= AY_NOISE_BAR + 60
+            or SCC_PERIOD_BAR <= x <= SCC_PERIOD_BAR + BAR_WIDTH
+            or SCC_VOLUME_BAR <= x <= SCC_VOLUME_BAR + 80
+            or SCC_WAVEFORM_BAR <= x <= SCC_WAVEFORM_BAR + 120
+        )
+
     def _handle_pointer(self, x: int, y: int, right: bool, drag: bool = False) -> None:
-        row = (y - 28) // LINE_HEIGHT
-        if row < 0 or row >= VISIBLE_ROWS:
+        row = (y - GRID_TOP) // LINE_HEIGHT
+        if row < 0 or row >= self._visible_rows():
             return
         index = self._top_row() + row
         if index >= MAX_FX_LEN:
@@ -427,6 +799,9 @@ class AyFxEditor(tk.Tk):
         frame = self.effect.frames[index]
         scc = self.scc_frame(index)
         width = max(self.canvas.winfo_width(), 1320)
+        gutter = self._selection_gutter_at(x)
+        if gutter is None and any(x1 <= x <= x2 for x1, x2 in NON_SELECTABLE_TEXT_RANGES):
+            return
         self.cursor_row = index
         if x < 45:
             frame.selected = not right
@@ -434,30 +809,21 @@ class AyFxEditor(tk.Tk):
             frame.t = not right
         elif 72 <= x <= 92:
             frame.n = not right
-        elif 104 <= x <= 145:
-            self.cursor_col = 0
-        elif 156 <= x <= 190:
-            self.cursor_col = 1
-        elif 198 <= x <= 222:
-            self.cursor_col = 2
-        elif SCC_PERIOD_COL - 4 <= x <= SCC_PERIOD_COL + 44:
-            self.cursor_col = 3
-        elif SCC_VOLUME_COL - 4 <= x <= SCC_VOLUME_COL + 36:
-            self.cursor_col = 4
-        elif SCC_WAVEFORM_COL - 4 <= x <= SCC_WAVEFORM_COL + 42:
-            self.cursor_col = 5
-            if index != 0:
-                self.status.set("SCC waveform is fixed by frame 000")
+        elif (target := self._text_cell_at(x, y)) is not None:
+            self._set_cell_target(*target)
+        elif gutter is not None:
+            column, _channel = gutter
+            self._set_cell_target(index, SELECTION_CURSOR_COLUMNS[column])
         elif AY_PERIOD_BAR <= x <= AY_PERIOD_BAR + BAR_WIDTH:
             frac = max(0, min(1, (x - AY_PERIOD_BAR) / BAR_WIDTH))
             if self.period_linear.get():
                 frame.tone = int(frac * 4095)
             else:
                 frame.tone = int(8.0 * math.exp(frac * math.log(4095.0 / 8.0)))
-        elif AY_NOISE_BAR <= x <= AY_NOISE_BAR + 60:
-            frame.noise = int(max(0, min(31, round((x - AY_NOISE_BAR) * 31 / 60))))
         elif AY_VOLUME_BAR <= x <= AY_VOLUME_BAR + 60:
             frame.volume = int(max(0, min(15, round((x - AY_VOLUME_BAR) * 15 / 60))))
+        elif AY_NOISE_BAR <= x <= AY_NOISE_BAR + 60:
+            frame.noise = int(max(0, min(31, round((x - AY_NOISE_BAR) * 31 / 60))))
         elif SCC_PERIOD_BAR <= x <= SCC_PERIOD_BAR + BAR_WIDTH:
             frac = max(0, min(1, (x - SCC_PERIOD_BAR) / BAR_WIDTH))
             if self.period_linear.get():
@@ -476,25 +842,31 @@ class AyFxEditor(tk.Tk):
 
     def on_mousewheel(self, event: tk.Event) -> None:
         delta = -5 if event.delta > 0 else 5
-        self.top_row = max(0, min(MAX_FX_LEN - VISIBLE_ROWS, self._top_row() + delta))
+        self.top_row = max(0, min(MAX_FX_LEN - self._visible_rows(), self._top_row() + delta))
         self.refresh_grid()
 
     def on_scrollbar(self, *args: str) -> None:
         if args[0] == "moveto":
             self.top_row = int(float(args[1]) * MAX_FX_LEN)
         elif args[0] == "scroll":
-            self.top_row = self._top_row() + int(args[1]) * (VISIBLE_ROWS if args[2] == "pages" else 5)
-        self.top_row = max(0, min(MAX_FX_LEN - VISIBLE_ROWS, self.top_row))
+            page_size = self._visible_rows() if args[2] == "pages" else 5
+            self.top_row = self._top_row() + int(args[1]) * page_size
+        self.top_row = max(0, min(MAX_FX_LEN - self._visible_rows(), self.top_row))
         self.refresh_grid()
 
     def commit_name(self) -> None:
-        self.effect.name = self.name_var.get()[:255] or clean_effect_filename(self.effect.name)
+        new_name = self.name_var.get()[:255] or clean_effect_filename(self.effect.name)
+        if new_name == self.effect.name:
+            return
+        self._record_undo()
+        self.effect.name = new_name
         self.refresh_all()
 
     def new_bank(self) -> None:
         self.stop()
         wavetable_names = list(self.bank.wavetable_names)
         wavetables = [list(wave) for wave in self.bank.wavetables]
+        self._record_undo()
         self.bank = Bank()
         self.bank.wavetable_names = wavetable_names
         self.bank.wavetables = wavetables
@@ -510,7 +882,9 @@ class AyFxEditor(tk.Tk):
         try:
             wavetable_names = list(self.bank.wavetable_names)
             wavetables = [list(wave) for wave in self.bank.wavetables]
-            self.bank = load_afb(path)
+            loaded_bank = load_afb(path)
+            self._record_undo()
+            self.bank = loaded_bank
             self.bank.wavetable_names = wavetable_names
             self.bank.wavetables = wavetables
             self.current_index = 0
@@ -565,7 +939,10 @@ class AyFxEditor(tk.Tk):
         if not path:
             return
         try:
-            self.bank.wavetable_names, self.bank.wavetables = parse_wavetable_asm(path)
+            wavetable_names, wavetables = parse_wavetable_asm(path)
+            self._record_undo()
+            self.bank.wavetable_names = wavetable_names
+            self.bank.wavetables = wavetables
             self.status.set(f"Loaded wavetable {Path(path).name}")
             self.refresh_grid()
         except Exception as exc:
@@ -586,11 +963,13 @@ class AyFxEditor(tk.Tk):
 
     def generate_sfx(self, template: str) -> None:
         waveform = self.scc_initial_waveform()
+        self._record_undo()
         generate_template(self.effect, template, waveform)
         self.status.set(f"Generated {template} template")
         self.refresh_grid()
 
     def apply_fade(self, channel: str, start: int, end: int) -> None:
+        self._record_undo()
         fade_volume(self.effect, channel, start, end)
         self.status.set("Applied volume fade")
         self.refresh_grid()
@@ -602,11 +981,13 @@ class AyFxEditor(tk.Tk):
         end = simpledialog.askinteger("Pitch sweep", "End period", initialvalue=1200, minvalue=0, maxvalue=4095, parent=self)
         if end is None:
             return
+        self._record_undo()
         sweep_period(self.effect, channel, start, end)
         self.status.set("Applied period sweep")
         self.refresh_grid()
 
     def randomize_noise(self) -> None:
+        self._record_undo()
         randomize_psg_noise(self.effect)
         self.status.set("Randomized PSG noise")
         self.refresh_grid()
@@ -615,6 +996,7 @@ class AyFxEditor(tk.Tk):
         amount = simpledialog.askinteger("Randomize period", "Maximum +/- amount", initialvalue=24, minvalue=0, maxvalue=4095, parent=self)
         if amount is None:
             return
+        self._record_undo()
         randomize_period(self.effect, "both", amount)
         self.status.set("Randomized period")
         self.refresh_grid()
@@ -626,6 +1008,7 @@ class AyFxEditor(tk.Tk):
         period = simpledialog.askinteger("Tremolo", "Frames per cycle", initialvalue=4, minvalue=1, maxvalue=64, parent=self)
         if period is None:
             return
+        self._record_undo()
         tremolo(self.effect, "both", depth, period)
         self.status.set("Applied tremolo")
         self.refresh_grid()
@@ -637,6 +1020,7 @@ class AyFxEditor(tk.Tk):
         off_frames = simpledialog.askinteger("Gate", "Off frames", initialvalue=2, minvalue=1, maxvalue=64, parent=self)
         if off_frames is None:
             return
+        self._record_undo()
         gate(self.effect, "both", on_frames, off_frames)
         self.status.set("Applied gate")
         self.refresh_grid()
@@ -648,21 +1032,25 @@ class AyFxEditor(tk.Tk):
         decay = simpledialog.askinteger("Echo", "Decay volume 0-15", initialvalue=8, minvalue=0, maxvalue=15, parent=self)
         if decay is None:
             return
+        self._record_undo()
         echo(self.effect, "both", delay, decay)
         self.status.set("Applied echo")
         self.refresh_grid()
 
     def interpolate(self) -> None:
+        self._record_undo()
         interpolate_selected(self.effect, "both")
         self.status.set("Interpolated selected range")
         self.refresh_grid()
 
     def reverse(self) -> None:
+        self._record_undo()
         reverse_selected(self.effect)
         self.status.set("Reversed selected range")
         self.refresh_grid()
 
     def copy_to_scc(self) -> None:
+        self._record_undo()
         copy_psg_to_scc(self.effect)
         self.status.set("Copied PSG period/volume to SCC")
         self.refresh_grid()
@@ -672,7 +1060,9 @@ class AyFxEditor(tk.Tk):
         if not path:
             return
         try:
-            self.bank.effects[self.current_index] = load_afx_pair(path)
+            loaded_effect = load_afx_pair(path)
+            self._record_undo()
+            self.bank.effects[self.current_index] = loaded_effect
             self.status.set(f"Loaded {Path(path).name}")
             self.refresh_all()
         except Exception as exc:
@@ -691,6 +1081,7 @@ class AyFxEditor(tk.Tk):
         paths = filedialog.askopenfilenames(filetypes=[("AYFX effects", "*.afx"), ("All files", "*.*")])
         if not paths:
             return
+        self._record_undo()
         start = len(self.bank.effects) - 1
         if self.bank.effects[start].real_len() > 0:
             start += 1
@@ -718,12 +1109,14 @@ class AyFxEditor(tk.Tk):
         self.status.set("Saved non-empty effects")
 
     def clear_effect(self) -> None:
+        self._record_undo()
         self.effect.clear()
         self.status.set("Effect cleared")
         self.refresh_grid()
 
     def add_effect(self) -> None:
         try:
+            self._record_undo()
             self.current_index = self.bank.add()
             self.refresh_all()
         except ValueError as exc:
@@ -731,6 +1124,7 @@ class AyFxEditor(tk.Tk):
 
     def insert_effect(self) -> None:
         try:
+            self._record_undo()
             self.bank.insert(self.current_index)
             self.refresh_all()
         except ValueError as exc:
@@ -739,6 +1133,7 @@ class AyFxEditor(tk.Tk):
     def delete_effect(self) -> None:
         if not messagebox.askyesno("Delete effect", "Delete current effect?"):
             return
+        self._record_undo()
         self.current_index = self.bank.delete(self.current_index)
         self.refresh_all()
 
@@ -748,20 +1143,27 @@ class AyFxEditor(tk.Tk):
         self.refresh_all()
 
     def select_all(self) -> None:
+        self.column_selection = None
         for frame in self.effect.frames[: self.effect.real_len()]:
             frame.selected = True
         self.refresh_grid()
 
     def unselect_all(self) -> None:
         self.effect.deselect_all()
+        self.column_selection = None
         self.refresh_grid()
 
     def inverse_selection(self) -> None:
+        self.column_selection = None
         for frame in self.effect.frames[: self.effect.real_len()]:
             frame.selected = not frame.selected
         self.refresh_grid()
 
     def copy(self) -> None:
+        if self.column_selection:
+            self._copy_columns()
+            return
+        self.column_clipboard = None
         selected = [index for index, frame in enumerate(self.effect.frames) if frame.selected]
         self.clipboard = [self.effect.frames[index].clone() for index in selected]
         self.scc_clipboard = [self.effect.scc_frames[index].clone() for index in selected]
@@ -773,12 +1175,23 @@ class AyFxEditor(tk.Tk):
         self.unselect_all()
 
     def cut(self) -> None:
+        self._record_undo()
+        if self.column_selection:
+            self._copy_columns()
+            if self.column_clipboard:
+                self._clear_selected_columns()
+            return
         self.copy()
-        self.delete_selection(force_cursor=True)
+        self.delete_selection(force_cursor=True, record_undo=False)
 
     def paste(self) -> None:
+        if self.column_clipboard:
+            self._record_undo()
+            self._paste_columns()
+            return
         if not self.clipboard:
             return
+        self._record_undo()
         frames = self.effect.frames
         count = min(len(self.clipboard), MAX_FX_LEN - self.cursor_row)
         for _ in range(count):
@@ -795,7 +1208,83 @@ class AyFxEditor(tk.Tk):
             scc_frames[self.cursor_row + offset].selected = False
         self.refresh_grid()
 
-    def delete_selection(self, force_cursor: bool = False) -> None:
+    def _copy_columns(self) -> None:
+        if not self.column_selection:
+            return
+        first_row, last_row, first_col, last_col, channel = self.column_selection
+        fields = [
+            field
+            for selected_channel, field, _x1, _x2 in SELECTABLE_COLUMNS[first_col : last_col + 1]
+            if selected_channel == channel and field is not None
+        ]
+        fields = list(dict.fromkeys(fields))
+        self.clipboard = []
+        self.scc_clipboard = []
+        if not fields:
+            self.column_clipboard = None
+            self.status.set("Selection contains only ignored data (AY noise or SCC wave)")
+            return
+        source = self.effect.frames if channel == "psg" else self.scc_effect_frames()
+        values = [{field: getattr(source[row], field) for field in fields} for row in range(first_row, last_row + 1)]
+        self.column_clipboard = {"channel": channel, "fields": fields, "values": values}
+        labels = ", ".join("period" if field == "tone" else field for field in fields)
+        self.status.set(f"Copied {len(values)} {channel.upper()} row(s): {labels}")
+
+    def _paste_columns(self) -> None:
+        if not self.column_clipboard:
+            return
+        if self.column_selection:
+            first_row, _last_row, first_col, last_col, channel = self.column_selection
+            destination_fields = {
+                field
+                for selected_channel, field, _x1, _x2 in SELECTABLE_COLUMNS[first_col : last_col + 1]
+                if selected_channel == channel and field is not None
+            }
+        else:
+            first_row = self.cursor_row
+            channel = "psg" if self.cursor_col <= 2 else "scc"
+            destination_fields = {"tone", "volume"}
+        clipboard_fields = set(self.column_clipboard["fields"])
+        fields = clipboard_fields & destination_fields
+        if not fields:
+            self.status.set("Paste target contains no matching period or volume column")
+            return
+        values = self.column_clipboard["values"]
+        count = min(len(values), MAX_FX_LEN - first_row)
+        destination = self.effect.frames if channel == "psg" else self.scc_effect_frames()
+        for offset in range(count):
+            for field in fields:
+                setattr(destination[first_row + offset], field, values[offset][field])
+        source_channel = str(self.column_clipboard["channel"]).upper()
+        labels = ", ".join("period" if field == "tone" else field for field in sorted(fields))
+        self.status.set(f"Pasted {count} row(s) from {source_channel} to {channel.upper()}: {labels}")
+        self.refresh_grid()
+
+    def _clear_selected_columns(self) -> None:
+        if not self.column_selection:
+            return
+        first_row, last_row, first_col, last_col, channel = self.column_selection
+        fields = {
+            field
+            for selected_channel, field, _x1, _x2 in SELECTABLE_COLUMNS[first_col : last_col + 1]
+            if selected_channel == channel and field is not None
+        }
+        if not fields:
+            self.status.set("Selection contains only ignored data (AY noise or SCC wave)")
+            return
+        destination = self.effect.frames if channel == "psg" else self.scc_effect_frames()
+        for row in range(first_row, last_row + 1):
+            for field in fields:
+                setattr(destination[row], field, 0)
+        self.status.set(f"Cleared selected {channel.upper()} period/volume data")
+        self.refresh_grid()
+
+    def delete_selection(self, force_cursor: bool = False, record_undo: bool = True) -> None:
+        if record_undo:
+            self._record_undo()
+        if self.column_selection and not force_cursor:
+            self._clear_selected_columns()
+            return
         if force_cursor or not any(frame.selected for frame in self.effect.frames):
             self.effect.frames[self.cursor_row].selected = True
         selected = [frame.selected for frame in self.effect.frames]
@@ -807,6 +1296,7 @@ class AyFxEditor(tk.Tk):
         self.refresh_grid()
 
     def insert_frame(self, clone: bool = False) -> None:
+        self._record_undo()
         src = self.effect.frames[self.cursor_row].clone() if clone else Frame()
         src.selected = False
         self.effect.frames.insert(self.cursor_row, src)
@@ -826,8 +1316,10 @@ class AyFxEditor(tk.Tk):
         if channel is None:
             return
         try:
-            self.bank.effects[self.current_index] = import_psg(path, channel)
-            self.clear_scc_effect()
+            imported_effect = import_psg(path, channel)
+            self._record_undo()
+            self.bank.effects[self.current_index] = imported_effect
+            self._clear_scc_frames()
             self.refresh_all()
         except Exception as exc:
             messagebox.showerror("Import PSG", str(exc))
@@ -837,8 +1329,10 @@ class AyFxEditor(tk.Tk):
         if not path:
             return
         try:
-            self.bank.effects[self.current_index] = import_wav(path)
-            self.clear_scc_effect()
+            imported_effect = import_wav(path)
+            self._record_undo()
+            self.bank.effects[self.current_index] = imported_effect
+            self._clear_scc_frames()
             self.refresh_all()
         except Exception as exc:
             messagebox.showerror("Import WAV", str(exc))
@@ -852,8 +1346,10 @@ class AyFxEditor(tk.Tk):
             return
         include_noise = messagebox.askyesno("VGM import", "Include SN76489 noise channel?")
         try:
-            self.bank.effects[self.current_index] = import_vgm(path, channel, include_noise)
-            self.clear_scc_effect()
+            imported_effect = import_vgm(path, channel, include_noise)
+            self._record_undo()
+            self.bank.effects[self.current_index] = imported_effect
+            self._clear_scc_frames()
             self.refresh_all()
         except Exception as exc:
             messagebox.showerror("Import VGM", str(exc))
@@ -935,8 +1431,10 @@ class WavetableEditor(tk.Toplevel):
         self.name_var = tk.StringVar()
         self.value_vars = [tk.IntVar() for _ in range(32)]
         self._play_file: str | None = None
+        self._canvas_drag_undo_recorded = False
         self._build()
         self.load_wave(0)
+        self.bind("<Control-z>", self.on_undo_shortcut)
 
     def _build(self) -> None:
         outer = ttk.Frame(self, padding=8)
@@ -963,6 +1461,7 @@ class WavetableEditor(tk.Toplevel):
         self.canvas.pack(fill="x", pady=8)
         self.canvas.bind("<Button-1>", self.on_canvas)
         self.canvas.bind("<B1-Motion>", self.on_canvas)
+        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
 
         grid = ttk.Frame(right)
         grid.pack(fill="x")
@@ -1007,15 +1506,22 @@ class WavetableEditor(tk.Toplevel):
             var.set(byte_to_signed(wave[pos]))
         self.draw_wave()
 
-    def store_wave(self) -> None:
-        self.editor.bank.wavetable_names[self.current] = self.name_var.get().strip() or f"{self.current:02X}"
-        wave = self.editor.bank.wavetables[self.current]
+    def store_wave(self, record_undo: bool = True) -> None:
+        new_name = self.name_var.get().strip() or f"{self.current:02X}"
+        new_wave = []
         for pos, var in enumerate(self.value_vars):
             try:
                 value = max(-128, min(127, int(var.get())))
             except tk.TclError:
                 value = 0
-            wave[pos] = signed_to_byte(value)
+            new_wave.append(signed_to_byte(value))
+        old_name = self.editor.bank.wavetable_names[self.current]
+        old_wave = self.editor.bank.wavetables[self.current]
+        if new_name != old_name or new_wave != old_wave:
+            if record_undo:
+                self.editor._record_undo()
+            self.editor.bank.wavetable_names[self.current] = new_name
+            self.editor.bank.wavetables[self.current] = new_wave
         self.listbox.delete(self.current)
         self.listbox.insert(self.current, f"{self.current:02X} {self.editor.bank.wavetable_names[self.current]}")
         self.listbox.selection_set(self.current)
@@ -1055,14 +1561,29 @@ class WavetableEditor(tk.Toplevel):
         index = max(0, min(31, round(event.x / max(1, width) * 31)))
         value = int(round((height / 2 - event.y) / max(1, height / 2 - 8) * 128))
         self.value_vars[index].set(max(-128, min(127, value)))
-        self.store_wave()
+        self.store_wave(record_undo=not self._canvas_drag_undo_recorded)
+        self._canvas_drag_undo_recorded = True
+
+    def on_canvas_release(self, _event: tk.Event) -> None:
+        self._canvas_drag_undo_recorded = False
+
+    def on_undo_shortcut(self, _event: tk.Event) -> str:
+        self.editor.undo()
+        self.listbox.delete(0, "end")
+        for index, name in enumerate(self.editor.bank.wavetable_names):
+            self.listbox.insert("end", f"{index:02X} {name}")
+        self.load_wave(self.current)
+        return "break"
 
     def load_file(self) -> None:
         path = filedialog.askopenfilename(parent=self, filetypes=[("ASM wavetable", "*.asm"), ("All files", "*.*")])
         if not path:
             return
         try:
-            self.editor.bank.wavetable_names, self.editor.bank.wavetables = parse_wavetable_asm(path)
+            wavetable_names, wavetables = parse_wavetable_asm(path)
+            self.editor._record_undo()
+            self.editor.bank.wavetable_names = wavetable_names
+            self.editor.bank.wavetables = wavetables
             self.listbox.delete(0, "end")
             for index, name in enumerate(self.editor.bank.wavetable_names):
                 self.listbox.insert("end", f"{index:02X} {name}")
@@ -1077,15 +1598,17 @@ class WavetableEditor(tk.Toplevel):
             save_wavetable_asm(path, self.editor.bank.wavetable_names, self.editor.bank.wavetables)
 
     def replace_wave(self, wave: list[int]) -> None:
+        self.editor._record_undo()
         self.editor.bank.wavetables[self.current] = wave[:32]
         self.load_wave(self.current)
-        self.store_wave()
+        self.store_wave(record_undo=False)
 
     def transform_wave(self, transform) -> None:
         self.store_wave()
+        self.editor._record_undo()
         self.editor.bank.wavetables[self.current] = transform(self.editor.bank.wavetables[self.current])[:32]
         self.load_wave(self.current)
-        self.store_wave()
+        self.store_wave(record_undo=False)
 
     def play_wave(self) -> None:
         self.store_wave()

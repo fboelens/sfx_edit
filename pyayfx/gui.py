@@ -11,6 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .formats import (
+    SCC_CLOCK,
     export_csv,
     export_vt2,
     export_wav,
@@ -24,7 +25,7 @@ from .formats import (
     save_afb,
     save_afx_pair,
 )
-from .model import MAX_FX_LEN, Bank, Effect, Frame, clean_effect_filename
+from .model import AY_CLOCK, MAX_FX_LEN, Bank, Effect, Frame, clean_effect_filename
 from .sfx_tools import (
     copy_psg_to_scc,
     echo,
@@ -84,6 +85,34 @@ TEXT_CHANNEL_RANGES = {"psg": (100, 195), "scc": (242, 355)}
 NON_SELECTABLE_TEXT_RANGES = ((196, 239), (356, 425))
 SELECTION_GUTTER_WIDTH = 8
 UNDO_LIMIT = 50
+NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+WHITE_NOTES = (0, 2, 4, 5, 7, 9, 11)
+BLACK_KEY_AFTER = ((1, 1), (3, 2), (6, 4), (8, 5), (10, 6))
+PIANO_KEY_LABELS = {
+    0: "Z", 1: "S", 2: "X", 3: "D", 4: "C", 5: "V", 6: "G", 7: "B", 8: "H", 9: "N", 10: "J", 11: "M",
+    12: "Q", 13: "2", 14: "W", 15: "3", 16: "E", 17: "R", 18: "5", 19: "T", 20: "6", 21: "Y", 22: "7", 23: "U",
+    24: "I", 25: "9", 26: "O", 27: "0", 28: "P",
+}
+PIANO_KEY_OFFSETS = {label.casefold(): offset for offset, label in PIANO_KEY_LABELS.items()}
+PIANO_SCALES = {
+    "Chromatic": set(range(12)),
+    "Major": {0, 2, 4, 5, 7, 9, 11},
+    "Natural minor": {0, 2, 3, 5, 7, 8, 10},
+    "Pentatonic": {0, 2, 4, 7, 9},
+}
+
+
+def piano_note_name(midi_note: int) -> str:
+    return f"{NOTE_NAMES[midi_note % 12]}{midi_note // 12 - 1}"
+
+
+def piano_note_period(midi_note: int, channel: str) -> int:
+    frequency = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
+    if channel == "scc":
+        period = round(SCC_CLOCK / (32.0 * frequency) - 1.0)
+    else:
+        period = round(AY_CLOCK / (16.0 * frequency))
+    return max(1, min(0x0FFF, period))
 
 
 @dataclass
@@ -91,6 +120,8 @@ class UndoState:
     bank: Bank
     effects: list[Effect]
     current_index: int
+    cursor_row: int
+    cursor_col: int
     effect: Effect
     effect_name: str
     frames: array
@@ -121,9 +152,12 @@ class AyFxEditor(tk.Tk):
         self.undo_stack: list[UndoState] = []
         self._left_drag_undo_recorded = False
         self.period_linear = tk.BooleanVar(value=True)
+        self.live_preview = tk.BooleanVar(value=True)
         self.export_all = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
         self._play_file: str | None = None
+        self._preview_effect = Effect("_preview")
+        self.piano_window: PianoWindow | None = None
         self.load_default_wavetable()
 
         self._build_menu()
@@ -173,6 +207,8 @@ class AyFxEditor(tk.Tk):
         view_menu = tk.Menu(menubar, tearoff=False)
         view_menu.add_radiobutton(label="Linear period", variable=self.period_linear, value=True, command=self.refresh_grid)
         view_menu.add_radiobutton(label="Logarithmic period", variable=self.period_linear, value=False, command=self.refresh_grid)
+        view_menu.add_separator()
+        view_menu.add_checkbutton(label="Live edit preview", variable=self.live_preview)
         menubar.add_cascade(label="View", menu=view_menu)
 
         wave_menu = tk.Menu(menubar, tearoff=False)
@@ -246,6 +282,7 @@ class AyFxEditor(tk.Tk):
         ttk.Button(toolbar, text="PSG", command=lambda: self.play(channel="psg")).pack(side="left", padx=(4, 0))
         ttk.Button(toolbar, text="SCC", command=lambda: self.play(channel="scc")).pack(side="left", padx=(4, 0))
         ttk.Button(toolbar, text="Stop", command=self.stop).pack(side="left", padx=(4, 12))
+        ttk.Button(toolbar, text="Piano", command=self.open_piano).pack(side="left", padx=(0, 12))
         ttk.Button(toolbar, text="Add", command=self.add_effect).pack(side="left")
         ttk.Button(toolbar, text="Del", command=self.delete_effect).pack(side="left", padx=(4, 12))
         ttk.Button(toolbar, text="|<", width=3, command=lambda: self.go_effect(0)).pack(side="left")
@@ -293,14 +330,20 @@ class AyFxEditor(tk.Tk):
         self.canvas.bind("<Control-c>", self.on_copy_shortcut)
         self.canvas.bind("<Control-v>", self.on_paste_shortcut)
         self.canvas.bind("<Control-z>", self.on_undo_shortcut)
+        self.canvas.bind("<KeyPress-plus>", self.on_next_effect_shortcut)
+        self.canvas.bind("<KeyPress-KP_Add>", self.on_next_effect_shortcut)
+        self.canvas.bind("<KeyPress-minus>", self.on_previous_effect_shortcut)
+        self.canvas.bind("<KeyPress-KP_Subtract>", self.on_previous_effect_shortcut)
+        self.canvas.bind("<KeyPress-Home>", self.on_first_effect_shortcut)
+        self.canvas.bind("<KeyPress-End>", self.on_last_effect_shortcut)
+        self.canvas.bind("<Control-Home>", lambda _event: self.set_cursor(0))
+        self.canvas.bind("<Control-End>", lambda _event: self.set_cursor(max(0, self.effect.real_len() - 1)))
         self.bind("<Delete>", lambda _event: self.delete_selection())
         self.bind("<Insert>", lambda event: self.insert_frame(clone=bool(event.state & 0x4)))
         self.bind("<Up>", lambda _event: self.move_cursor(0, -1))
         self.bind("<Down>", lambda _event: self.move_cursor(0, 1))
         self.bind("<Left>", lambda _event: self.move_cursor(-1, 0))
         self.bind("<Right>", lambda _event: self.move_cursor(1, 0))
-        self.bind("<Home>", lambda _event: self.set_cursor(0))
-        self.bind("<End>", lambda _event: self.set_cursor(max(0, self.effect.real_len() - 1)))
         self.bind("<Return>", lambda _event: self.play())
         self.bind("<Control-Return>", lambda _event: self.play(from_cursor=True))
         self.bind("<space>", lambda _event: self.stop())
@@ -323,6 +366,22 @@ class AyFxEditor(tk.Tk):
 
     def on_undo_shortcut(self, _event: tk.Event) -> str:
         self.undo()
+        return "break"
+
+    def on_previous_effect_shortcut(self, _event: tk.Event) -> str:
+        self.go_effect(self.current_index - 1)
+        return "break"
+
+    def on_next_effect_shortcut(self, _event: tk.Event) -> str:
+        self.go_effect(self.current_index + 1)
+        return "break"
+
+    def on_first_effect_shortcut(self, _event: tk.Event) -> str:
+        self.go_effect(0)
+        return "break"
+
+    def on_last_effect_shortcut(self, _event: tk.Event) -> str:
+        self.go_effect(len(self.bank.effects) - 1)
         return "break"
 
     @staticmethod
@@ -361,6 +420,8 @@ class AyFxEditor(tk.Tk):
                 bank=self.bank,
                 effects=list(self.bank.effects),
                 current_index=self.current_index,
+                cursor_row=self.cursor_row,
+                cursor_col=self.cursor_col,
                 effect=effect,
                 effect_name=effect.name,
                 frames=self._pack_frames(effect.frames),
@@ -385,6 +446,8 @@ class AyFxEditor(tk.Tk):
         self.bank.wavetable_names = list(state.wavetable_names)
         self.bank.wavetables = [list(wave) for wave in state.wavetables]
         self.current_index = max(0, min(state.current_index, len(self.bank.effects) - 1))
+        self.cursor_row = max(0, min(MAX_FX_LEN - 1, state.cursor_row))
+        self.cursor_col = max(0, min(5, state.cursor_col))
         self.column_selection = None
         self.status.set(f"Undo ({len(self.undo_stack)} action(s) remaining)")
         self.refresh_all()
@@ -613,12 +676,14 @@ class AyFxEditor(tk.Tk):
             elif self.cursor_col == 5:
                 scc.noise = ((scc.noise << 4) | digit) & 0x1f
         self.refresh_grid()
+        self.preview_frame(channel="scc" if self.cursor_col >= 3 else "psg")
 
     def toggle_flag(self, flag: str) -> None:
         self._record_undo()
         frame = self.effect.frames[self.cursor_row]
         setattr(frame, flag, not getattr(frame, flag))
         self.refresh_grid()
+        self.preview_frame(channel="psg")
 
     def on_click(self, event: tk.Event) -> None:
         self.canvas.focus_set()
@@ -774,8 +839,20 @@ class AyFxEditor(tk.Tk):
             self._left_drag_undo_recorded = True
         self._handle_pointer(event.x, event.y, right=False, drag=True)
 
-    def on_left_release(self, _event: tk.Event) -> None:
+    def on_left_release(self, event: tk.Event) -> None:
+        if self._left_drag_undo_recorded:
+            channel = self._preview_channel_at_x(event.x)
+            if channel:
+                self.preview_frame(channel=channel)
         self._left_drag_undo_recorded = False
+
+    @staticmethod
+    def _preview_channel_at_x(x: int) -> str | None:
+        if 48 <= x <= 92 or AY_PERIOD_BAR <= x <= AY_NOISE_BAR + 60:
+            return "psg"
+        if SCC_PERIOD_BAR <= x <= SCC_WAVEFORM_BAR + 120:
+            return "scc"
+        return None
 
     @staticmethod
     def _pointer_edits_data(x: int) -> bool:
@@ -960,6 +1037,13 @@ class AyFxEditor(tk.Tk):
 
     def edit_wavetables(self) -> None:
         WavetableEditor(self).wait_window()
+
+    def open_piano(self) -> None:
+        if self.piano_window is not None and self.piano_window.winfo_exists():
+            self.piano_window.lift()
+            self.piano_window.focus_set()
+            return
+        self.piano_window = PianoWindow(self)
 
     def generate_sfx(self, template: str) -> None:
         waveform = self.scc_initial_waveform()
@@ -1207,6 +1291,7 @@ class AyFxEditor(tk.Tk):
             scc_frames[self.cursor_row + offset] = self.scc_clipboard[offset].clone()
             scc_frames[self.cursor_row + offset].selected = False
         self.refresh_grid()
+        self.preview_frame(channel="both")
 
     def _copy_columns(self) -> None:
         if not self.column_selection:
@@ -1259,6 +1344,7 @@ class AyFxEditor(tk.Tk):
         labels = ", ".join("period" if field == "tone" else field for field in sorted(fields))
         self.status.set(f"Pasted {count} row(s) from {source_channel} to {channel.upper()}: {labels}")
         self.refresh_grid()
+        self.preview_frame(first_row, channel)
 
     def _clear_selected_columns(self) -> None:
         if not self.column_selection:
@@ -1307,6 +1393,8 @@ class AyFxEditor(tk.Tk):
         scc_frames.insert(self.cursor_row, scc_src)
         del scc_frames[-1]
         self.refresh_grid()
+        if clone:
+            self.preview_frame(channel="both")
 
     def import_psg_dialog(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("PSG AY register dump", "*.psg"), ("All files", "*.*")])
@@ -1384,8 +1472,31 @@ class AyFxEditor(tk.Tk):
             self.status.set(f"Exported {Path(path).name}")
 
     def play(self, from_cursor: bool = False, channel: str = "both") -> None:
-        self.stop()
         data = render_wav_bytes(self.effect, self.cursor_row if from_cursor else 0, self.bank.wavetables, channel)
+        label = {"psg": "PSG", "scc": "SCC"}.get(channel, "mix")
+        self._play_wav_data(data, f"Playing {label}")
+
+    def preview_frame(self, row: int | None = None, channel: str | None = None) -> None:
+        if not self.live_preview.get():
+            return
+        row = self.cursor_row if row is None else max(0, min(MAX_FX_LEN - 1, row))
+        channel = channel or ("scc" if self.cursor_col >= 3 else "psg")
+        psg = self.effect.frames[row].clone()
+        scc = self.effect.scc_frames[row].clone()
+        psg.selected = False
+        scc.selected = False
+        psg.volume = psg.volume or 15
+        scc.volume = scc.volume or 15
+        psg.t = True
+        psg.n = False
+        scc.noise = self.scc_initial_waveform()
+        self._preview_effect.frames[0] = psg if channel != "scc" else Frame()
+        self._preview_effect.scc_frames[0] = scc if channel != "psg" else Frame()
+        data = render_wav_bytes(self._preview_effect, 0, self.bank.wavetables, channel)
+        self._play_wav_data(data)
+
+    def _play_wav_data(self, data: bytes, status_text: str | None = None) -> None:
+        self.stop()
         handle = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         handle.write(data)
         handle.close()
@@ -1397,8 +1508,8 @@ class AyFxEditor(tk.Tk):
         else:
             self.status.set(f"Rendered preview to {self._play_file}")
             return
-        label = {"psg": "PSG", "scc": "SCC"}.get(channel, "mix")
-        self.status.set(f"Playing {label}")
+        if status_text:
+            self.status.set(status_text)
 
     def stop(self) -> None:
         if sys.platform.startswith("win"):
@@ -1417,6 +1528,203 @@ class AyFxEditor(tk.Tk):
 
     def unsupported(self, text: str) -> None:
         messagebox.showinfo("Not yet ported", text)
+
+
+class PianoWindow(tk.Toplevel):
+    WHITE_KEY_WIDTH = 30
+    WHITE_KEY_HEIGHT = 180
+    BLACK_KEY_WIDTH = 18
+    BLACK_KEY_HEIGHT = 105
+    OCTAVES = 3
+
+    def __init__(self, editor: AyFxEditor) -> None:
+        super().__init__(editor)
+        self.editor = editor
+        self.title("Piano Note Input")
+        self.resizable(False, False)
+        self.transient(editor)
+        target = "scc" if editor.cursor_col >= 3 else "psg"
+        current_frame = editor.scc_frame(editor.cursor_row) if target == "scc" else editor.effect.frames[editor.cursor_row]
+        self.target_var = tk.StringVar(value=target)
+        self.root_var = tk.StringVar(value="C")
+        self.scale_var = tk.StringVar(value="Major")
+        self.octave_var = tk.IntVar(value=self._initial_octave(current_frame.tone, target))
+        self.volume_var = tk.IntVar(value=current_frame.volume or 15)
+        self.frames_var = tk.IntVar(value=1)
+        self.note_var = tk.StringVar(value=f"Row {editor.cursor_row:03X}")
+        self._build()
+        self.draw_piano()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Control-z>", self.on_undo)
+        self.after_idle(self.canvas.focus_set)
+
+    @staticmethod
+    def _initial_octave(period: int, channel: str) -> int:
+        if period <= 0:
+            return 4
+        if channel == "scc":
+            frequency = SCC_CLOCK / (32.0 * (period + 1))
+        else:
+            frequency = AY_CLOCK / (16.0 * period)
+        midi_note = round(69 + 12 * math.log2(max(1.0, frequency) / 440.0))
+        return max(1, min(6, midi_note // 12 - 1))
+
+    def _build(self) -> None:
+        controls = ttk.Frame(self, padding=(10, 10, 10, 6))
+        controls.pack(fill="x")
+        ttk.Label(controls, text="Target").grid(row=0, column=0, sticky="w")
+        target = ttk.Combobox(controls, textvariable=self.target_var, values=("psg", "scc", "both"), state="readonly", width=7)
+        target.grid(row=0, column=1, padx=(5, 14))
+        ttk.Label(controls, text="Root").grid(row=0, column=2, sticky="w")
+        root = ttk.Combobox(controls, textvariable=self.root_var, values=NOTE_NAMES, state="readonly", width=5)
+        root.grid(row=0, column=3, padx=(5, 14))
+        ttk.Label(controls, text="Scale").grid(row=0, column=4, sticky="w")
+        scale = ttk.Combobox(controls, textvariable=self.scale_var, values=tuple(PIANO_SCALES), state="readonly", width=14)
+        scale.grid(row=0, column=5, padx=(5, 0))
+
+        ttk.Label(controls, text="Octave").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        octave = ttk.Spinbox(controls, from_=1, to=6, textvariable=self.octave_var, width=6, command=self.draw_piano)
+        octave.grid(row=1, column=1, sticky="w", padx=(5, 14), pady=(8, 0))
+        ttk.Label(controls, text="Volume").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Spinbox(controls, from_=0, to=15, textvariable=self.volume_var, width=6).grid(row=1, column=3, sticky="w", padx=(5, 14), pady=(8, 0))
+        ttk.Label(controls, text="Frames").grid(row=1, column=4, sticky="w", pady=(8, 0))
+        ttk.Spinbox(controls, from_=1, to=256, textvariable=self.frames_var, width=6).grid(row=1, column=5, sticky="w", padx=(5, 0), pady=(8, 0))
+        ttk.Checkbutton(controls, text="Preview", variable=self.editor.live_preview).grid(row=1, column=6, padx=(16, 4), pady=(8, 0))
+        ttk.Button(controls, text="Rest", command=self.insert_rest).grid(row=1, column=7, padx=(4, 4), pady=(8, 0))
+        ttk.Button(controls, text="Close", command=self.close).grid(row=1, column=8, padx=(4, 0), pady=(8, 0))
+        ttk.Label(controls, textvariable=self.note_var, anchor="e").grid(row=0, column=6, columnspan=3, sticky="e", padx=(16, 0))
+        root.bind("<<ComboboxSelected>>", lambda _event: self.draw_piano())
+        scale.bind("<<ComboboxSelected>>", lambda _event: self.draw_piano())
+        octave.bind("<KeyRelease>", lambda _event: self.draw_piano())
+
+        width = self.OCTAVES * 7 * self.WHITE_KEY_WIDTH
+        self.canvas = tk.Canvas(self, width=width, height=self.WHITE_KEY_HEIGHT, background="#d9d9d9", highlightthickness=1, takefocus=True)
+        self.canvas.pack(padx=10, pady=(0, 10))
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<KeyPress>", self.on_keypress)
+
+    def _scale_contains(self, midi_note: int) -> bool:
+        root = NOTE_NAMES.index(self.root_var.get())
+        return (midi_note - root) % 12 in PIANO_SCALES[self.scale_var.get()]
+
+    def draw_piano(self) -> None:
+        if not hasattr(self, "canvas"):
+            return
+        self.canvas.delete("all")
+        try:
+            base_octave = max(1, min(6, int(self.octave_var.get())))
+        except (tk.TclError, ValueError):
+            base_octave = 4
+        for octave in range(self.OCTAVES):
+            for white_index, semitone in enumerate(WHITE_NOTES):
+                offset = octave * 12 + semitone
+                midi_note = (base_octave + 1) * 12 + offset
+                x1 = (octave * 7 + white_index) * self.WHITE_KEY_WIDTH
+                x2 = x1 + self.WHITE_KEY_WIDTH
+                fill = "#edf4ff" if self._scale_contains(midi_note) else "#ffffff"
+                tags = ("piano_key", f"note_{offset}")
+                self.canvas.create_rectangle(x1, 0, x2, self.WHITE_KEY_HEIGHT, fill=fill, outline="#687080", tags=tags)
+                key_label = PIANO_KEY_LABELS.get(offset, "")
+                note_label = piano_note_name(midi_note) if semitone == 0 else NOTE_NAMES[semitone]
+                self.canvas.create_text((x1 + x2) / 2, 137, text=key_label, fill="#506080", tags=tags)
+                self.canvas.create_text((x1 + x2) / 2, 163, text=note_label, fill="#202020", tags=tags)
+        for octave in range(self.OCTAVES):
+            for semitone, boundary in BLACK_KEY_AFTER:
+                offset = octave * 12 + semitone
+                midi_note = (base_octave + 1) * 12 + offset
+                x1 = (octave * 7 + boundary) * self.WHITE_KEY_WIDTH - self.BLACK_KEY_WIDTH / 2
+                x2 = x1 + self.BLACK_KEY_WIDTH
+                fill = "#203a66" if self._scale_contains(midi_note) else "#111111"
+                tags = ("piano_key", f"note_{offset}")
+                self.canvas.create_rectangle(x1, 0, x2, self.BLACK_KEY_HEIGHT, fill=fill, outline="#000000", tags=tags)
+                self.canvas.create_text((x1 + x2) / 2, 80, text=PIANO_KEY_LABELS.get(offset, ""), fill="#ffffff", tags=tags)
+
+    def on_canvas_click(self, _event: tk.Event) -> None:
+        self.canvas.focus_set()
+        current = self.canvas.find_withtag("current")
+        if not current:
+            return
+        for tag in self.canvas.gettags(current[0]):
+            if tag.startswith("note_"):
+                self.insert_note(int(tag[5:]))
+                return
+
+    def on_keypress(self, event: tk.Event) -> str | None:
+        if event.keysym == "space":
+            self.insert_rest()
+            return "break"
+        offset = PIANO_KEY_OFFSETS.get(event.char.casefold())
+        if offset is None:
+            return None
+        self.insert_note(offset)
+        return "break"
+
+    def _settings(self) -> tuple[str, int, int]:
+        target = self.target_var.get()
+        try:
+            volume = max(0, min(15, int(self.volume_var.get())))
+        except (tk.TclError, ValueError):
+            volume = 15
+        try:
+            frames = max(1, min(256, int(self.frames_var.get())))
+        except (tk.TclError, ValueError):
+            frames = 1
+        return target, volume, frames
+
+    def insert_note(self, offset: int) -> None:
+        try:
+            base_octave = max(1, min(6, int(self.octave_var.get())))
+        except (tk.TclError, ValueError):
+            base_octave = 4
+        midi_note = (base_octave + 1) * 12 + offset
+        target, volume, frames = self._settings()
+        start = self.editor.cursor_row
+        count = min(frames, MAX_FX_LEN - start)
+        self.editor._record_undo()
+        for row in range(start, start + count):
+            if target in ("psg", "both"):
+                frame = self.editor.effect.frames[row]
+                frame.tone = piano_note_period(midi_note, "psg")
+                frame.volume = volume
+                frame.t = True
+                frame.n = False
+            if target in ("scc", "both"):
+                frame = self.editor.effect.scc_frames[row]
+                frame.tone = piano_note_period(midi_note, "scc")
+                frame.volume = volume
+        self._finish_input(start, count, f"{piano_note_name(midi_note)}  Vol {volume}")
+        self.editor.preview_frame(start, target)
+
+    def insert_rest(self) -> None:
+        target, _volume, frames = self._settings()
+        start = self.editor.cursor_row
+        count = min(frames, MAX_FX_LEN - start)
+        self.editor._record_undo()
+        for row in range(start, start + count):
+            if target in ("psg", "both"):
+                self.editor.effect.frames[row].volume = 0
+            if target in ("scc", "both"):
+                self.editor.effect.scc_frames[row].volume = 0
+        self._finish_input(start, count, "Rest")
+        self.editor.stop()
+
+    def _finish_input(self, start: int, count: int, description: str) -> None:
+        last_row = start + max(0, count - 1)
+        self.editor.cursor_row = min(MAX_FX_LEN - 1, start + count)
+        self.editor.cursor_col = 3 if self.target_var.get() == "scc" else 0
+        self.editor.ensure_cursor_visible()
+        self.editor.status.set(f"Piano {description}: rows {start:03X}-{last_row:03X}")
+        self.note_var.set(f"{description}  {start:03X}-{last_row:03X}")
+        self.editor.refresh_grid()
+
+    def on_undo(self, _event: tk.Event) -> str:
+        self.editor.undo()
+        self.note_var.set(f"Undo - row {self.editor.cursor_row:03X}")
+        return "break"
+
+    def close(self) -> None:
+        self.editor.piano_window = None
+        self.destroy()
 
 
 class WavetableEditor(tk.Toplevel):

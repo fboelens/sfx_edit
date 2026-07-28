@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 
-from pyayfx.formats import decode_effect, encode_effect, load_afb, load_afx_pair, save_afb, save_afx_pair
-from pyayfx.model import Bank, Effect, Frame
+from pyayfx.formats import decode_effect, encode_effect, load_afb, load_afx_pair, render_wav_bytes, save_afb, save_afx_pair
+from pyayfx.model import MIX_RATE, Bank, Effect, Frame
 
 
 class ToneFlagRoundTripTests(unittest.TestCase):
@@ -45,6 +46,19 @@ class ToneFlagRoundTripTests(unittest.TestCase):
             save_afb(bank, path)
             loaded = load_afb(path)
             self.assert_split_tone_flags(loaded.effects[0])
+
+    def test_scc_tone_flag_controls_rendered_sound(self) -> None:
+        effect = Effect("SCC tone enable")
+        effect.scc_frames[0] = Frame(tone=0x345, noise=0, volume=15, t=False)
+        effect.scc_frames[1] = Frame(tone=0x345, volume=15, t=True)
+        wave = [0x7F] * 16 + [0x80] * 16
+
+        wav = render_wav_bytes(effect, wavetables=[wave], channel="scc")
+        samples = struct.unpack(f"<{(len(wav) - 44) // 2}h", wav[44:])
+        samples_per_frame = MIX_RATE // 50
+
+        self.assertTrue(all(sample == 0 for sample in samples[:samples_per_frame]))
+        self.assertTrue(any(sample != 0 for sample in samples[samples_per_frame : 2 * samples_per_frame]))
 
 
 if __name__ == "__main__":

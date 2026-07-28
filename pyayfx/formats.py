@@ -406,7 +406,7 @@ def export_wav(effect: Effect, path: str | Path, wavetables: list[list[int]] | N
 def render_scc_wave_bytes(wave: list[int], period: int = 120, volume: int = 15, seconds: float = 1.0) -> bytes:
     samples = bytearray()
     phase = 0.0
-    frame = Frame(period, 0, volume)
+    frame = Frame(period, 0, volume, t=True)
     total_samples = max(1, int(MIX_RATE * seconds))
     wavetables = [wave]
     for _ in range(total_samples):
@@ -426,7 +426,7 @@ def render_scc_wave_bytes(wave: list[int], period: int = 120, volume: int = 15, 
 
 
 def _scc_sample(frame: Frame, wavetables: list[list[int]] | None, phase: float, waveform: int) -> int:
-    if not wavetables or frame.volume <= 0:
+    if not frame.t or not wavetables or frame.volume <= 0:
         return 0
     wave_index = max(0, min(len(wavetables) - 1, waveform))
     wave = wavetables[wave_index]

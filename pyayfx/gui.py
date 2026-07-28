@@ -57,6 +57,12 @@ BAR_WIDTH = 260
 SCC_PERIOD_COL = 250
 SCC_VOLUME_COL = 314
 SCC_WAVEFORM_COL = 362
+PSG_TONE_ENABLE_COL = 52
+PSG_NOISE_ENABLE_COL = 76
+SCC_TONE_ENABLE_COL = 222
+PSG_TONE_ENABLE_RANGE = (PSG_TONE_ENABLE_COL - 4, PSG_TONE_ENABLE_COL + 16)
+PSG_NOISE_ENABLE_RANGE = (PSG_NOISE_ENABLE_COL - 4, PSG_NOISE_ENABLE_COL + 16)
+SCC_TONE_ENABLE_RANGE = (SCC_TONE_ENABLE_COL - 4, SCC_TONE_ENABLE_COL + 16)
 AY_PERIOD_BAR = 430
 AY_VOLUME_BAR = 700
 AY_NOISE_BAR = 770
@@ -81,8 +87,8 @@ TEXT_CELL_COLUMNS = (
     (3, 242, 307),
     (4, 308, 355),
 )
-TEXT_CHANNEL_RANGES = {"psg": (100, 195), "scc": (242, 355)}
-NON_SELECTABLE_TEXT_RANGES = ((196, 239), (356, 425))
+TEXT_CHANNEL_RANGES = {"psg": (48, 195), "scc": (218, 355)}
+NON_SELECTABLE_TEXT_RANGES = ((196, 217), (239, 249), (356, 425))
 SELECTION_GUTTER_WIDTH = 8
 UNDO_LIMIT = 50
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -347,7 +353,7 @@ class AyFxEditor(tk.Tk):
         self.bind("<Return>", lambda _event: self.play())
         self.bind("<Control-Return>", lambda _event: self.play(from_cursor=True))
         self.bind("<space>", lambda _event: self.stop())
-        self.bind("t", lambda _event: self.toggle_flag("t"))
+        self.bind("t", lambda _event: self.toggle_tone())
         self.bind("n", lambda _event: self.toggle_flag("n"))
         for char in "0123456789abcdefABCDEF":
             self.bind(char, self.enter_hex)
@@ -473,11 +479,12 @@ class AyFxEditor(tk.Tk):
                     self.canvas.create_rectangle(bar_x1, 0, bar_x2, GRID_TOP, fill="#dce9ff", outline="")
         headers = [
             ("Pos", 8),
-            ("T", 52),
-            ("N", 76),
+            ("PT", PSG_TONE_ENABLE_COL),
+            ("N", PSG_NOISE_ENABLE_COL),
             ("Per", 108),
             ("V", 160),
             ("Ns", 202),
+            ("ST", SCC_TONE_ENABLE_COL),
             ("SPer", SCC_PERIOD_COL),
             ("SVol", SCC_VOLUME_COL),
             ("SWf", SCC_WAVEFORM_COL),
@@ -501,7 +508,7 @@ class AyFxEditor(tk.Tk):
         frame = self.effect.frames[index]
         scc = self.scc_frame(index)
         y = GRID_TOP + row * LINE_HEIGHT
-        actual = index < self.effect.real_len()
+        actual = index < max(self.effect.real_len(), self.effect.scc_real_len())
         bg = "#dff3df" if frame.selected else "#ffffff"
         if index == self.cursor_row:
             bg = "#e8f0ff"
@@ -511,8 +518,9 @@ class AyFxEditor(tk.Tk):
             self.canvas.create_rectangle(x1, y, x2, y + LINE_HEIGHT, fill="#edf4ff", outline="")
         color = "#111" if actual else "#888"
         self.canvas.create_text(8, y + 2, text=f"{index:03X}", anchor="nw", fill=color)
-        self.canvas.create_text(54, y + 2, text="T" if frame.t else "-", anchor="nw", fill=color)
-        self.canvas.create_text(78, y + 2, text="N" if frame.n else "-", anchor="nw", fill=color)
+        self.canvas.create_text(PSG_TONE_ENABLE_COL + 2, y + 2, text="T" if frame.t else "-", anchor="nw", fill=color)
+        self.canvas.create_text(PSG_NOISE_ENABLE_COL + 2, y + 2, text="N" if frame.n else "-", anchor="nw", fill=color)
+        self.canvas.create_text(SCC_TONE_ENABLE_COL + 2, y + 2, text="T" if scc.t else "-", anchor="nw", fill=color)
         initial_waveform = self.scc_initial_waveform()
         effective_waveform = initial_waveform
         wave_name = self.bank.wavetable_names[effective_waveform] if 0 <= effective_waveform < len(self.bank.wavetable_names) else ""
@@ -685,6 +693,14 @@ class AyFxEditor(tk.Tk):
         self.refresh_grid()
         self.preview_frame(channel="psg")
 
+    def toggle_tone(self) -> None:
+        self._record_undo()
+        channel = "scc" if self.cursor_col >= 3 else "psg"
+        frame = self.scc_frame(self.cursor_row) if channel == "scc" else self.effect.frames[self.cursor_row]
+        frame.t = not frame.t
+        self.refresh_grid()
+        self.preview_frame(channel=channel)
+
     def on_click(self, event: tk.Event) -> None:
         self.canvas.focus_set()
         self.column_selection = None
@@ -695,6 +711,15 @@ class AyFxEditor(tk.Tk):
 
     def on_right_click(self, event: tk.Event) -> None:
         self.canvas.focus_set()
+        flag_channel = self._flag_channel_at_x(event.x)
+        if flag_channel is not None and self._visible_row_at(event.y) is not None:
+            self._record_undo()
+            self._right_anchor = None
+            self._right_dragged = False
+            self._right_popup_allowed = False
+            self._handle_pointer(event.x, event.y, right=True)
+            self.preview_frame(channel=flag_channel)
+            return
         cell = self._selection_cell_at(event.x, event.y)
         self._right_dragged = False
         self._right_popup_allowed = cell is not None
@@ -848,16 +873,28 @@ class AyFxEditor(tk.Tk):
 
     @staticmethod
     def _preview_channel_at_x(x: int) -> str | None:
-        if 48 <= x <= 92 or AY_PERIOD_BAR <= x <= AY_NOISE_BAR + 60:
+        if (
+            PSG_TONE_ENABLE_RANGE[0] <= x <= PSG_NOISE_ENABLE_RANGE[1]
+            or AY_PERIOD_BAR <= x <= AY_NOISE_BAR + 60
+        ):
             return "psg"
-        if SCC_PERIOD_BAR <= x <= SCC_WAVEFORM_BAR + 120:
+        if SCC_TONE_ENABLE_RANGE[0] <= x <= SCC_TONE_ENABLE_RANGE[1] or SCC_PERIOD_BAR <= x <= SCC_WAVEFORM_BAR + 120:
+            return "scc"
+        return None
+
+    @staticmethod
+    def _flag_channel_at_x(x: int) -> str | None:
+        if PSG_TONE_ENABLE_RANGE[0] <= x <= PSG_NOISE_ENABLE_RANGE[1]:
+            return "psg"
+        if SCC_TONE_ENABLE_RANGE[0] <= x <= SCC_TONE_ENABLE_RANGE[1]:
             return "scc"
         return None
 
     @staticmethod
     def _pointer_edits_data(x: int) -> bool:
         return (
-            48 <= x <= 92
+            PSG_TONE_ENABLE_RANGE[0] <= x <= PSG_NOISE_ENABLE_RANGE[1]
+            or SCC_TONE_ENABLE_RANGE[0] <= x <= SCC_TONE_ENABLE_RANGE[1]
             or AY_PERIOD_BAR <= x <= AY_PERIOD_BAR + BAR_WIDTH
             or AY_VOLUME_BAR <= x <= AY_VOLUME_BAR + 60
             or AY_NOISE_BAR <= x <= AY_NOISE_BAR + 60
@@ -882,10 +919,15 @@ class AyFxEditor(tk.Tk):
         self.cursor_row = index
         if x < 45:
             frame.selected = not right
-        elif 48 <= x <= 68:
+        elif PSG_TONE_ENABLE_RANGE[0] <= x <= PSG_TONE_ENABLE_RANGE[1]:
+            self.cursor_col = 0
             frame.t = not right
-        elif 72 <= x <= 92:
+        elif PSG_NOISE_ENABLE_RANGE[0] <= x <= PSG_NOISE_ENABLE_RANGE[1]:
+            self.cursor_col = 2
             frame.n = not right
+        elif SCC_TONE_ENABLE_RANGE[0] <= x <= SCC_TONE_ENABLE_RANGE[1]:
+            self.cursor_col = 3
+            scc.t = not right
         elif (target := self._text_cell_at(x, y)) is not None:
             self._set_cell_target(*target)
         elif gutter is not None:
